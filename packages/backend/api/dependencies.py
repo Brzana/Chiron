@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.backend.core.database import async_session
-from packages.backend.core.security import decode_token
+from packages.backend.core.security import TokenDecodeError, decode_token
 from packages.backend.models.models import Course, RoleEnum, User, course_enrollment
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -17,11 +17,25 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 		yield session
 
 
-def _unauthorized_exception() -> HTTPException:
+def _unauthorized_exception(
+	code: str = "credentials_invalid",
+	message: str = "Could not validate credentials.",
+) -> HTTPException:
 	return HTTPException(
 		status_code=status.HTTP_401_UNAUTHORIZED,
-		detail="Could not validate credentials.",
+		detail={"code": code, "message": message},
 		headers={"WWW-Authenticate": "Bearer"},
+	)
+
+
+def _auth_exception_from_token_error(error: TokenDecodeError) -> HTTPException:
+	status_code = error.status_code
+	headers = {"WWW-Authenticate": "Bearer"} if status_code == status.HTTP_401_UNAUTHORIZED else None
+
+	return HTTPException(
+		status_code=status_code,
+		detail=error.as_detail(),
+		headers=headers,
 	)
 
 
@@ -47,22 +61,32 @@ async def get_current_user(
 	db: AsyncSession = Depends(get_db),
 ) -> User:
 	if credentials is None or credentials.scheme.lower() != "bearer":
-		raise _unauthorized_exception()
+		raise _unauthorized_exception(
+			code="credentials_missing",
+			message="Bearer token is missing from the Authorization header.",
+		)
 
-	token_payload = decode_token(credentials.credentials)
-	if token_payload is None:
-		raise _unauthorized_exception()
+	try:
+		token_payload = decode_token(credentials.credentials)
+	except TokenDecodeError as exc:
+		raise _auth_exception_from_token_error(exc) from exc
 
 	try:
 		user_id = int(token_payload.sub)
 	except ValueError as exc:
-		raise _unauthorized_exception() from exc
+		raise _unauthorized_exception(
+			code="token_subject_invalid",
+			message="Token subject must be a valid user id.",
+		) from exc
 
 	user_result = await db.execute(select(User).where(User.id == user_id))
 	user = user_result.scalar_one_or_none()
 
 	if user is None:
-		raise _unauthorized_exception()
+		raise _unauthorized_exception(
+			code="user_not_found",
+			message="User referenced by token no longer exists.",
+		)
 
 	return user
 
